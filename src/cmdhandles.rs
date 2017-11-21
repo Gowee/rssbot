@@ -185,6 +185,26 @@ fn register_sub(bot: &telebot::RcBot, db: Database, lphandle: Handle) {
                 })
         })
         .and_then(|(bot, db, subscriber, feed_link, chat_id, lphandle)| {
+            if db.get_all_feeds().len() >= 1500 {
+                future::Either::A(bot.message(chat_id,
+                                              "已达到全局最大订阅数量, \
+                                               为防止服务器压力过大请退订不需要的 RSS 或者\
+                                               [自己搭建服务](https://github.com/iovxw/rssbot)\n\
+                                               注: 本机器人主要用于提供即时提醒功能, 例如服务器状态监控和社区论坛提醒\n\
+                                               默认更新频率为 5 分钟, 不建议用于其他类型的 RSS 订阅\n\
+                                               如有相关需求推荐使用其他 RSS 机器人实现"
+                                              .to_owned())
+                    .send()
+                    .map_err(Some)
+                    .map(move |(bot, _)|
+                         (bot, db, subscriber, feed_link, chat_id, lphandle)
+                    ))
+            } else {
+                future::Either::B(Ok((bot, db, subscriber, feed_link, chat_id, lphandle))
+                                  .into_future())
+            }
+        })
+        .and_then(|(bot, db, subscriber, feed_link, chat_id, lphandle)| {
             bot.message(chat_id, "处理中, 请稍候".to_owned())
                 .send()
                 .map_err(Some)
