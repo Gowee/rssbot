@@ -194,11 +194,10 @@ fn register_sub(bot: &telebot::RcBot, db: Database, lphandle: Handle) {
                                                默认更新频率为 5 分钟, 不建议用于其他类型的 RSS 订阅\n\
                                                如有相关需求推荐使用其他 RSS 机器人实现"
                                               .to_owned())
+                    .parse_mode("Markdown")
+                    .disable_web_page_preview(true)
                     .send()
-                    .map_err(Some)
-                    .map(move |(bot, _)|
-                         (bot, db, subscriber, feed_link, chat_id, lphandle)
-                    ))
+                    .then(|_| Err(None)))
             } else {
                 future::Either::B(Ok((bot, db, subscriber, feed_link, chat_id, lphandle))
                                   .into_future())
