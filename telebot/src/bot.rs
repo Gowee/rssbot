@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::str;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use curl::easy::{Easy, List};
 use futures::sync::mpsc;
@@ -19,6 +19,8 @@ use serde::de::DeserializeOwned;
 use serde_json;
 use tokio_core::reactor::{Handle, Interval};
 use tokio_curl::Session;
+
+const UPDATE_ID_EXPIRATION: Duration = Duration::from_secs(604800);
 
 /// A clonable, single threaded bot
 ///
@@ -47,6 +49,7 @@ pub struct Bot {
     pub key: String,
     pub handle: Handle,
     pub last_id: Cell<u32>,
+    pub timestamp: Cell<Instant>,
     pub update_interval: Cell<u64>,
     pub handlers: RefCell<HashMap<String, UnboundedSender<(RcBot, objects::Message)>>>,
     pub session: Session,
@@ -60,6 +63,7 @@ impl Bot {
             handle: handle.clone(),
             key: key.into(),
             last_id: Cell::new(0),
+            timestamp: Cell::new(Instant::now()),
             update_interval: Cell::new(1000),
             handlers: RefCell::new(HashMap::new()),
             session: Session::new(handle.clone()),
@@ -100,13 +104,15 @@ impl Bot {
         req.url(&format!(
             "https://api.telegram.org/bot{}/{}",
             self.key, func
-        )).unwrap();
+        ))
+        .unwrap();
 
         let r2 = result.clone();
         req.write_function(move |data| {
             r2.lock().unwrap().extend_from_slice(data);
             Ok(data.len())
-        }).unwrap();
+        })
+        .unwrap();
 
         self.session
             .perform(req)
@@ -183,53 +189,59 @@ impl RcBot {
         Interval::new(
             Duration::from_millis(self.inner.update_interval.get()),
             &self.inner.handle,
-        ).unwrap()
-            .map_err(|_| Error::Unknown)
-            .and_then(move |_| {
-                self.get_updates()
-                    .offset(self.inner.last_id.get())
-                    .timeout(60)
-                    .send()
-            })
-            .map(|(_, x)| stream::iter_ok(x.0))
-            .flatten()
-            .and_then(move |x| {
-                if self.inner.last_id.get() < x.update_id as u32 + 1 {
-                    self.inner.last_id.set(x.update_id as u32 + 1);
-                }
+        )
+        .unwrap()
+        .map_err(|_| Error::Unknown)
+        .and_then(move |_| {
+            self.get_updates()
+                .offset(self.inner.last_id.get())
+                .timeout(60)
+                .send()
+        })
+        .map(|(_, x)| stream::iter_ok(x.0))
+        .flatten()
+        .filter(move |x| {
+            // If there are no new updates for at least a week, then update_id will be randomly.
+            let fresh_update_id =
+                Instant::now().duration_since(self.inner.timestamp.get()) < UPDATE_ID_EXPIRATION;
+            let valid_update_id = self.inner.last_id.get() < x.update_id as u32 + 1;
+            if !fresh_update_id || valid_update_id {
+                self.inner.timestamp.set(Instant::now());
+                self.inner.last_id.set(x.update_id as u32 + 1);
+            }
+            !fresh_update_id || valid_update_id
+        })
+        .filter_map(move |mut val| {
+            debug!("Got an update from Telegram: {:?}", val);
+            let mut forward: Option<String> = None;
 
-                Ok(x)
-            })
-            .filter_map(move |mut val| {
-                debug!("Got an update from Telegram: {:?}", val);
-                let mut forward: Option<String> = None;
+            if let Some(ref mut message) = val.message {
+                if let Some(text) = message.text.clone() {
+                    let mut content = text.split_whitespace();
+                    if let Some(cmd) = content.next() {
+                        let s: Vec<&str> = cmd.split("@").take(2).collect();
+                        if s.len() > 0
+                            && (s.len() < 2 || s[1] == self.inner.username)
+                            && self.inner.handlers.borrow().contains_key(s[0])
+                        {
+                            message.text = Some(content.collect::<Vec<&str>>().join(" "));
 
-                if let Some(ref mut message) = val.message {
-                    if let Some(text) = message.text.clone() {
-                        let mut content = text.split_whitespace();
-                        if let Some(cmd) = content.next() {
-                            let s: Vec<&str> = cmd.split("@").take(2).collect();
-                            if s.len() > 0 && (s.len() < 2 || s[1] == self.inner.username)
-                                && self.inner.handlers.borrow().contains_key(s[0])
-                            {
-                                message.text = Some(content.collect::<Vec<&str>>().join(" "));
-
-                                forward = Some(s[0].into());
-                            }
+                            forward = Some(s[0].into());
                         }
                     }
                 }
+            }
 
-                if let Some(cmd) = forward {
-                    if let Some(sender) = self.inner.handlers.borrow_mut().get_mut(&cmd) {
-                        sender
-                            .unbounded_send((self.clone(), val.message.unwrap()))
-                            .unwrap();
-                    }
-                    return None;
-                } else {
-                    return Some((self.clone(), val));
+            if let Some(cmd) = forward {
+                if let Some(sender) = self.inner.handlers.borrow_mut().get_mut(&cmd) {
+                    sender
+                        .unbounded_send((self.clone(), val.message.unwrap()))
+                        .unwrap();
                 }
-            })
+                return None;
+            } else {
+                return Some((self.clone(), val));
+            }
+        })
     }
 }
